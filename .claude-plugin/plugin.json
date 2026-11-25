@@ -1,0 +1,9 @@
+{
+  "name": "showme",
+  "version": "0.1.0",
+  "description": "Draw how something in this project works, on one page.",
+  "author": { "name": "rythm" },
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/rh-stack/showme",
+  "repository": "https://github.com/rh-stack/showme"
+}

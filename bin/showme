@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join, parse as splitPath, resolve } from 'node:path'
+
+const NEXT = /^>(?:\s*(\d+)(?:\s+(.+))?)?$/
+const size = text => [...text].length
+const over = (name, text, max) => size(text) > max ? [`${name} ${size(text)} chars, limit ${max}`] : []
+const words = text => text.split(/\s+/).length
+const prose = (name, text, max) => [...over(name, text, max),
+  ...(/[;–—]|:\s|\s-\s/.test(text) ? [`${name} a colon, semicolon or dash. Use a full stop`] : []),
+  ...text.split(/[.!?]\s+/).filter(part => words(part) > 15).map(part => `${name} a sentence of ${words(part)} words, limit 15`)]
+const indent = line => line.search(/\S|$/)
+const escape = text => text.replace(/[&<>"]/g, c => `&#${c.charCodeAt()};`)
+
+function parse(text) {
+  const lines = text.split(/\r?\n/).map(line => line.trim())
+  const [head, ...blocks] = lines.join('\n').trim().split(/\n{2,}/).map(block => block.split('\n'))
+  const steps = blocks.map((block, index) => {
+    const [first, what, why, file, code, ...nexts] = block
+    const number = index + 1, label = `${number} `
+    const exits = nexts.map(line => NEXT.exec(line)).filter(Boolean)
+    const plain = exits.find(exit => !exit[2]), jump = exits.find(exit => exit[2])
+    const following = number < blocks.length ? number + 1 : 0
+    return {
+      number, what, why, file, code, nexts, exits, length: block.length,
+      place: first.startsWith(label) ? first.slice(label.length).trim() : '',
+      run: plain ? Number(plain[1] ?? 0) : following,
+      jump: jump && { to: Number(jump[1]), when: jump[2] },
+    }
+  })
+  const places = [...new Set(steps.map(step => step.place).filter(Boolean))]
+  return { head, question: head[0], answer: head[1] ?? '', note: head[2] ?? '', steps, places }
+}
+
+// A run goes straight when no other dot stands between in the target's column.
+const isStraight = (steps, { number, run }) =>
+  run > number && !steps.slice(number, run - 1).some(step => step.place === steps[run - 1].place)
+
+// All other lines take a track.
+const tracked = steps => steps.flatMap(step => [
+  ...(step.run && !isStraight(steps, step) ? [{ step, to: step.run }] : []),
+  ...(step.jump ? [{ step, ...step.jump }] : []),
+])
+
+function checkCode(step) {
+  let lines
+  try { lines = readFileSync(step.file, 'utf8').split(/\r?\n/) } catch { return [`cannot read ${step.file}`] }
+  const found = lines.flatMap((line, i) => line.includes(step.code) ? [i + 1] : [])
+  if (!found.length) return [`"${step.code}" is not in ${step.file}. Copy part of one line exactly`]
+  if (found.length > 1) return [`"${step.code}" is on ${found.length} lines of ${step.file}: ${found.slice(0, 9).join(', ')}. Copy a longer part`]
+  const excerpt = lines.slice(found[0] - 1, found[0] + 3), margin = indent(excerpt[0])
+  const end = excerpt.findIndex(line => line.trim() && indent(line) < margin)
+  Object.assign(step, { line: found[0], excerpt: excerpt.slice(0, end < 0 ? 4 : end).map(line => line.slice(margin)) })
+  return []
+}
+
+function checkStep(step, total) {
+  if (step.length < 5) return [`${step.length} lines, needs at least 5`]
+  const jumps = step.exits.filter(exit => exit[2])
+  return [
+    ...over('place has', step.place, 18), ...prose('line 2 has', step.what, 28), ...prose('line 3 has', step.why, 140),
+    ...step.nexts.flatMap((line, i) => NEXT.test(line) ? [] : [`line ${i + 6} must be ">", "> <step>" or "> <step> <when>"`]),
+    ...step.exits.flatMap(([, to]) => to && (to < 1 || to > total) ? [`no step ${to}`] : []),
+    ...jumps.flatMap(exit => over('jump words have', exit[2], 20)),
+    ...(jumps.length > 1 ? [`${jumps.length} jumps, limit 1`] : []),
+    ...(step.exits.length - jumps.length > 1 ? ['more than one ">" line without words. Keep one'] : []),
+    ...checkCode(step),
+  ]
+}
+
+function check({ head, answer, note, steps, places }) {
+  const problems = [...prose('answer has', answer, 160), ...prose('note has', note, 160)]
+  if (head.length < 2 || head.length > 3) problems.push(`first block has ${head.length} lines. It needs question, answer and maybe a note`)
+  if (steps.length < 2 || steps.length > 9) problems.push(`map has ${steps.length} steps, limit 2 to 9`)
+  if (places.length > 4) problems.push(`map has ${places.length} places, limit 4: ${places.join(', ')}`)
+  const bad = steps.flatMap(step => step.place
+    ? checkStep(step, steps.length).map(text => `step ${step.number}: ${text}`)
+    : [`block ${step.number}: first line must be "${step.number} <place>"`])
+  const jumps = bad.length ? [] : tracked(steps)
+  if (jumps.length > 3) problems.push(`map has ${jumps.length} jumps, limit 3: ${jumps.map(j => `${j.step.number} > ${j.to}`).join(', ')}`)
+  return [...problems, ...bad]
+}
+
+const COL = 190, ROW = 120, CX = 36, CY = 24, R = 11
+const CSS = `:root{color-scheme:light dark;background:var(--bg);color:CanvasText;font:14px/20px system-ui;--jump:#3fa171;--bg:light-dark(Canvas,color-mix(in srgb,Canvas 96%,white));--dim:color-mix(in srgb,CanvasText 55%,transparent);--rule:color-mix(in srgb,CanvasText 12%,transparent)}
+body{margin:0;padding:24px 32px}header{display:grid;grid-template-columns:88px 1fr;align-items:baseline;margin-bottom:16px;overflow-wrap:anywhere}header span{color:var(--dim)}h1,header p{font:inherit;margin:0}.row{display:grid;height:${ROW}px}.map{position:relative}svg{position:absolute;top:0;left:0;overflow:visible}
+.places{position:sticky;top:0;z-index:1;height:auto;background:var(--bg);color:var(--dim);border-bottom:1px solid var(--rule)}.places div{padding:6px 0 6px ${CX - R}px}.places .words{padding-left:16px}.places .words+div{padding-left:0}
+path{fill:none;stroke:CanvasText;stroke-width:2.5}.jump{stroke:var(--jump);stroke-width:1.5}.rule{stroke:var(--rule);stroke-width:1}
+.head{stroke:none;fill:CanvasText}.jump.head{fill:var(--jump)}circle{fill:CanvasText}text{font-size:12px;fill:var(--jump)}.n{font-weight:600;fill:var(--bg);text-anchor:middle}
+.what{position:relative;margin:14px 0 0 ${CX + 18}px;width:124px;font-weight:600;overflow-wrap:anywhere}.why{padding:14px 24px 0 16px;overflow-wrap:anywhere}
+.code{padding-top:12px;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:2;font:12px/17px ui-monospace,monospace;color:var(--dim)}
+.file{line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.lines{max-height:85px;overflow:hidden}.code b,.file span{color:CanvasText}`
+
+// Path through axis-aligned points with rounded corners.
+function polyline(points) {
+  const toward = ([x, y], [a, b], r) => [x + Math.sign(a - x) * r, y + Math.sign(b - y) * r]
+  const corners = points.slice(1, -1).map((p, i) => {
+    const [a, b] = [points[i], points[i + 2]]
+    const r = Math.min(8, ...[a, b].map(q => (Math.abs(p[0] - q[0]) + Math.abs(p[1] - q[1])) / 2))
+    return `L${toward(p, a, r)}Q${p} ${toward(p, b, r)}`
+  })
+  return `M${points[0]}${corners.join('')}L${points.at(-1)}`
+}
+
+function drawLines(steps, dot) {
+  const runs = steps.filter(step => step.run && isStraight(steps, step)).map(step => {
+    const [x, y] = dot(step), [tx, ty] = dot(steps[step.run - 1]), edge = step.number * ROW
+    return `<path d="${polyline([[x, y], [x, edge], [tx, edge], [tx, ty]])}"/>`
+  })
+  const tracks = tracked(steps).map(({ step, to, when }, i) => {
+    const [x, y] = dot(step), [tx, ty] = dot(steps[to - 1]), track = tx - CX + 4 + 7 * i, tip = tx - R
+    const out = when ? x + (tx > x ? 6 : -6) : x, turn = step.number * ROW - (when ? 12 : 0), style = when ? 'jump' : ''
+    const line = polyline([[out, y], [out, turn], [track, turn], [track, ty], [tip - 4, ty]])
+    return `<path class="${style}" d="${line}"/><path class="${style} head" d="M${tip},${ty}l-6,-4v8z"/>`
+  })
+  return [...runs, ...tracks].join('')
+}
+
+function draw({ question, answer, note, steps, places }) {
+  const dot = step => [places.indexOf(step.place) * COL + CX, (step.number - 1) * ROW + CY]
+  const width = places.length * COL, height = steps.length * ROW
+  const columns = `grid-template-columns:repeat(${places.length},${COL}px) 290px minmax(320px,1fr)`
+  const rules = places.map((_, i) => `<path class="rule" d="M${(i + 1) * COL - 0.5},0V${height}"/>`).join('')
+  const marks = steps.map(step => [dot(step), step]).map(([[x, y], { number, jump }]) =>
+    `<circle cx="${x}" cy="${y}" r="${R}"/><text class="n" x="${x}" y="${y + 4}">${number}</text>` +
+    (jump ? `<text x="${x + 12}" y="${number * ROW - 17}">${escape(jump.when)} → ${jump.to}</text>` : '')).join('')
+  const rows = steps.map(({ place, what, why, file, line, excerpt: [first, ...rest] }) => `<div class="row">
+<div class="what" style="grid-column:${places.indexOf(place) + 1}">${escape(what)}</div>
+<div class="why" style="grid-column:${places.length + 1}">${escape(why)}</div>
+<div class="code"><div class="file"><span>${escape(`${basename(file)}:${line}`)}</span> ${escape(dirname(file).replace(/^\.$/, ''))}</div><div class="lines"><b>${escape(first)}</b>\n${escape(rest.join('\n'))}</div></div></div>`).join('\n')
+  return `<!doctype html><meta charset="utf-8"><title>${escape(question)}</title>
+<style>${CSS}body{min-width:${width + 610}px}.row{${columns}}</style><header><span>Question</span><h1>${escape(question)}</h1><span>TLDR</span><p>${escape(answer)}</p>${note && `<span>Note</span><p>${escape(note)}</p>`}</header>
+<div class="row places">${places.map(place => `<div>${escape(place)}</div>`).join('')}<div class="words">What happens</div><div>Code</div></div>
+<div class="map"><svg width="${width}" height="${height}">${rules}${drawLines(steps, dot)}${marks}</svg>${rows}</div>`
+}
+
+function main([project, file]) {
+  const path = resolve(file), { dir, name } = splitPath(path)
+  process.chdir(project)
+  const map = parse(readFileSync(path, 'utf8')), problems = check(map), page = join(dir, `${name}.html`)
+  if (problems.length) return problems.forEach(text => console.error(text)), process.exitCode = 1
+  writeFileSync(page, draw(map))
+  spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [page], { detached: true, stdio: 'ignore' })
+    .on('error', error => console.error(error.message)).unref()
+  console.log(page)
+}
+
+main(process.argv.slice(2))

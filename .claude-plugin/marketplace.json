@@ -1,0 +1,8 @@
+{
+  "name": "showme",
+  "description": "The showme plugin for Claude Code.",
+  "owner": { "name": "rythm" },
+  "plugins": [
+    { "name": "showme", "source": "./", "description": "Draw how something in this project works, on one page." }
+  ]
+}
